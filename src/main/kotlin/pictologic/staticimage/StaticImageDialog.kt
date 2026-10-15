@@ -13,6 +13,7 @@ import arc.scene.ui.Image
 import arc.scene.ui.Label
 import arc.scene.ui.Slider
 import arc.scene.ui.TextButton
+import arc.scene.ui.TextField
 import arc.scene.ui.Tooltip
 import arc.scene.ui.layout.Table
 import arc.util.Log
@@ -43,6 +44,8 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private var processorChoice = ProcessorChoice.MICRO_PROCESSOR
     private var aspectMode = AspectMode.FIT
     private var paletteColors = 16
+    private var watermarkText = ""
+    private var watermarkColorRgba = -0x1 // White (0xFFFFFFFF)
     private val isEncoding = AtomicBoolean(false)
 
     private var previewPixmap: Pixmap? = null
@@ -58,12 +61,28 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private val displayButtons = ArrayList<Pair<DisplayType, TextButton>>()
     private val aspectButtons = ArrayList<Pair<AspectMode, TextButton>>()
     private val procButtons = ArrayList<Pair<ProcessorChoice, TextButton>>()
+    private val wmColorButtons = ArrayList<Pair<Int, TextButton>>()
 
     private val gridValX = Label("10")
     private val gridValY = Label("10")
-    private val resVal = Label("320x320 px")
+    private val resVal = Label("308x308 px")
     private lateinit var sliderGridX: Slider
     private lateinit var sliderGridY: Slider
+
+    companion object {
+        // Preset RGBA8888 colors for watermark selection
+        private val WATERMARK_COLORS = listOf(
+            "White" to (0xFFFFFFFF.toInt()),
+            "Gold" to (0xFFD700FF.toInt()),
+            "Cyan" to (0x00E5FFFF.toInt()),
+            "Red" to (0xFF3B30FF.toInt()),
+            "Green" to (0x34C759FF.toInt()),
+            "Pink" to (0xFF69B4FF.toInt()),
+            "Orange" to (0xFF9500FF.toInt()),
+            "Purple" to (0xAF52DEFF.toInt()),
+            "Black" to (0x101014FF.toInt())
+        )
+    }
 
     init {
         addCloseButton()
@@ -134,6 +153,9 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
             val disabled = lockTo2x2 && proc != ProcessorChoice.LOGIC_PROCESSOR
             updateSelectableButton(btn, proc == processorChoice, disabled)
         }
+        for ((rgba, btn) in wmColorButtons) {
+            btn.isChecked = (rgba == watermarkColorRgba)
+        }
     }
 
     private fun buildUi() {
@@ -149,7 +171,8 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         val leftScroll = Table()
         leftScroll.pane(leftPane).grow().scrollX(false)
 
-        root.add(leftScroll).growY().width(460f).pad(8f)
+        // Expanded left settings panel width to 560f so all buttons and text fit comfortably!
+        root.add(leftScroll).growY().width(560f).pad(8f)
         root.image().color(Color.darkGray).width(4f).growY()
         root.add(rightPane).grow().pad(8f)
 
@@ -307,7 +330,45 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
 
         pane.add(step3).growX().padBottom(10f).row()
 
-        // --- STEP 4: ACTIONS & STATS ---
+        // --- STEP 4: WATERMARK (TOP-RIGHT) ---
+        val step4 = Table(Tex.button)
+        step4.margin(10f).top().left()
+        step4.add("[gold]4. Watermark (Góc trên bên phải - Tối đa 15 ký tự)[]").left().padBottom(6f).row()
+
+        val wmInputTable = Table()
+        wmInputTable.add(Label("Text: ")).left().padRight(6f)
+        val wmField = TextField(watermarkText)
+        wmField.maxLength = 15
+        wmField.messageText = "Nhập chữ (tối đa 15 ký tự)..."
+        wmField.changed {
+            watermarkText = wmField.text.take(15)
+        }
+        wmInputTable.add(wmField).growX().height(34f)
+        step4.add(wmInputTable).growX().padBottom(8f).row()
+
+        val wmColorTable = Table()
+        wmColorTable.add(Label("Color: ")).left().padRight(6f)
+        wmColorButtons.clear()
+        for ((cName, rgba) in WATERMARK_COLORS) {
+            val r = ((rgba ushr 24) and 0xFF) / 255f
+            val g = ((rgba ushr 16) and 0xFF) / 255f
+            val b = ((rgba ushr 8) and 0xFF) / 255f
+
+            val bColor = wmColorTable.button("", Styles.togglet) {
+                watermarkColorRgba = rgba
+                refreshButtonHighlights()
+                if (selectedFile != null) triggerEncoding()
+            }.size(30f, 30f).padRight(4f).get()
+            bColor.style.up = Tex.whiteui
+            bColor.color.set(r, g, b, 1f)
+            bColor.addTip("Màu Watermark: $cName")
+            wmColorButtons.add(rgba to bColor)
+        }
+        step4.add(wmColorTable).left().padBottom(4f).row()
+
+        pane.add(step4).growX().padBottom(10f).row()
+
+        // --- STEP 5: ACTIONS & STATS ---
         val actionTable = Table(Tex.button)
         actionTable.margin(10f).top().left()
 
@@ -359,7 +420,9 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
             gridY = gridScreensY,
             aspectMode = aspectMode,
             paletteSize = paletteColors,
-            processorChoice = processorChoice
+            processorChoice = processorChoice,
+            watermarkText = watermarkText,
+            watermarkColorRgba = watermarkColorRgba
         )
     }
 
@@ -478,7 +541,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         val w = pixmap.width
         val h = pixmap.height
         val borderColor = 0x2C2C36FF
-        val gridColor = if (isTiled) 0x3A3A46FF else 0x00E5FFFF // Cyan chunk lines for 3x3 & 6x6 screen chunks!
+        val gridColor = if (isTiled) 0x3A3A46FF else 0x00E5FFFF
 
         for (i in 0 until 2) {
             for (x in 0 until w) {

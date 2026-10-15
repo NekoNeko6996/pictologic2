@@ -5,6 +5,7 @@ import arc.graphics.Pixmap
 import pictologic.core.FrameSequence
 import pictologic.core.Palette
 import pictologic.core.RleRun
+import kotlin.math.max
 
 data class StaticWorkerSlice(
     val workerIndex: Int,
@@ -41,7 +42,7 @@ class StaticImageEncoder(
         val canvasW = config.effectiveDisplayWidth
         val canvasH = config.effectiveDisplayHeight
 
-        // 1. Scale image to exact total display pixel dimensions (including bezel gaps for multi-screen!)
+        // 1. Scale image to exact total display pixel dimensions
         val scaledPixmap = FrameSequence.scalePixmap(
             src = originalPixmap,
             targetW = canvasW,
@@ -50,10 +51,26 @@ class StaticImageEncoder(
         )
         originalPixmap.dispose()
 
-        // 2. Generate optimal palette
-        val palette = Palette.fromPixmaps(listOf(scaledPixmap), config.paletteSize)
+        val wmText = config.watermarkText.trim().take(15)
+        val hasWatermark = wmText.isNotEmpty()
 
-        // 3. Quantize pixels (invert Y so 0 is bottom-left as in Mindustry displays)
+        // 2. Generate optimal palette (reserve 1 slot for exact watermark color if watermark is active)
+        val baseColorCount = if (hasWatermark) max(2, config.paletteSize - 1) else config.paletteSize
+        val basePalette = Palette.fromPixmaps(listOf(scaledPixmap), baseColorCount)
+
+        val finalColors = if (hasWatermark && !basePalette.colors.contains(config.watermarkColorRgba)) {
+            basePalette.colors + intArrayOf(config.watermarkColorRgba)
+        } else {
+            basePalette.colors
+        }
+        val palette = Palette(finalColors)
+
+        // 3. Draw watermark onto scaledPixmap (top-right corner) before quantization
+        if (hasWatermark) {
+            drawWatermarkTopRight(scaledPixmap, wmText, config.watermarkColorRgba)
+        }
+
+        // 4. Quantize pixels (invert Y so 0 is bottom-left as in Mindustry displays)
         val indices = IntArray(canvasW * canvasH)
         val quantizedPixmap = Pixmap(canvasW, canvasH)
 
@@ -74,8 +91,6 @@ class StaticImageEncoder(
         var workerCounter = 0
 
         if (config.isMultiScreenChunked) {
-            // MODE B: 3x3 (80x80) or 6x6 (176x176) Displays
-            // Each display block is an independent chunk separated by `screenBezelGapPx` (16px physical frame border)
             val screenPx = config.displayType.nativeSize
             val stepPx = screenPx + config.screenBezelGapPx
 
@@ -121,8 +136,6 @@ class StaticImageEncoder(
                 }
             }
         } else {
-            // MODE A: 1x1 Tiled Logic Display (up to 16x16)
-            // Global seamless coordinate system across the entire canvas (offset by +6px bezel when drawing)
             val rawRuns = ArrayList<RleRun>()
             for (y in 0 until canvasH) {
                 val rowOffset = y * canvasW
@@ -161,6 +174,47 @@ class StaticImageEncoder(
             workerSlices = workerSlices,
             quantizedPixmap = quantizedPixmap
         )
+    }
+
+    /**
+     * Renders a crisp 5x7 pixel-art watermark at the top-right corner of [pixmap].
+     * Automatically scales font size according to canvas resolution.
+     */
+    private fun drawWatermarkTopRight(pixmap: Pixmap, text: String, colorRgba: Int) {
+        val w = pixmap.width
+        val h = pixmap.height
+        val scale = max(1, w / 180)
+        val charW = 5 * scale
+        val charH = 7 * scale
+        val spacing = 1 * scale
+        val margin = max(3, 4 * scale)
+
+        val totalTextW = text.length * charW + max(0, text.length - 1) * spacing
+        val startX = max(2, w - totalTextW - margin)
+        val startY = margin
+
+        for (i in text.indices) {
+            val ch = text[i].uppercaseChar()
+            val glyph = FONT_5X7[ch] ?: FONT_5X7['?']!!
+            val cx = startX + i * (charW + spacing)
+
+            for (row in 0 until 7) {
+                val rowBits = glyph[row]
+                for (col in 0 until 5) {
+                    if (((rowBits shr (4 - col)) and 1) != 0) {
+                        for (dy in 0 until scale) {
+                            for (dx in 0 until scale) {
+                                val px = cx + col * scale + dx
+                                val py = startY + row * scale + dy
+                                if (px in 0 until w && py in 0 until h) {
+                                    pixmap.set(px, py, colorRgba)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun mergeRunsVertically(runs: List<RleRun>): List<RleRun> {
@@ -231,5 +285,57 @@ class StaticImageEncoder(
         }
 
         return slices
+    }
+
+    companion object {
+        // Compact 5x7 pixel font table (5 bits per row, 7 rows per character)
+        private val FONT_5X7: Map<Char, IntArray> = mapOf(
+            ' ' to intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+            'A' to intArrayOf(0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+            'B' to intArrayOf(0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+            'C' to intArrayOf(0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+            'D' to intArrayOf(0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+            'E' to intArrayOf(0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+            'F' to intArrayOf(0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+            'G' to intArrayOf(0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F),
+            'H' to intArrayOf(0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+            'I' to intArrayOf(0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+            'J' to intArrayOf(0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C),
+            'K' to intArrayOf(0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+            'L' to intArrayOf(0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+            'M' to intArrayOf(0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11),
+            'N' to intArrayOf(0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11),
+            'O' to intArrayOf(0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+            'P' to intArrayOf(0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+            'Q' to intArrayOf(0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D),
+            'R' to intArrayOf(0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+            'S' to intArrayOf(0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+            'T' to intArrayOf(0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+            'U' to intArrayOf(0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+            'V' to intArrayOf(0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+            'W' to intArrayOf(0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11),
+            'X' to intArrayOf(0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+            'Y' to intArrayOf(0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04),
+            'Z' to intArrayOf(0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+            '0' to intArrayOf(0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
+            '1' to intArrayOf(0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+            '2' to intArrayOf(0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F),
+            '3' to intArrayOf(0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+            '4' to intArrayOf(0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02),
+            '5' to intArrayOf(0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+            '6' to intArrayOf(0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+            '7' to intArrayOf(0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+            '8' to intArrayOf(0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+            '9' to intArrayOf(0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+            '-' to intArrayOf(0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
+            '_' to intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F),
+            '.' to intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
+            ':' to intArrayOf(0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00),
+            '!' to intArrayOf(0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04),
+            '?' to intArrayOf(0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04),
+            '@' to intArrayOf(0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0E),
+            '#' to intArrayOf(0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A),
+            '/' to intArrayOf(0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10)
+        )
     }
 }

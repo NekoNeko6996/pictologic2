@@ -9,22 +9,9 @@ import mindustry.world.blocks.logic.LogicBlock
 import mindustry.world.blocks.logic.LogicBlock.LogicLink
 import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.min
 
 /**
- * Generates Mindustry Schematics for Static Images:
- *
- * 1. TILED 1x1 DISPLAY MODE (Max 16x16):
- *    - Global unified coordinate system (+6px bezel offset) across all merged 1x1 tiles.
- *    - Daisy-chained perimeter processors: Controller -> W1 -> W2 -> ... -> Wn.
- *    - Uses `sensor` on upstream processor / switch state and periodic refresh so 100% of slices render
- *      without ever disabling processors or exceeding link range!
- *
- * 2. MULTI-SCREEN CHUNK MODE (3x3 max 5x5, 6x6 max 4x4):
- *    - Forced 2x2 Logic Processors placed right next to the specific screen (gx, gy) they manage.
- *    - Zero dependency on a distant `cell1` (which previously caused outer chunks >14 tiles away to fail!).
- *    - Each chunk cluster links directly to its adjacent screen `display1` and renders autonomously,
- *      while also relaying the Master Controller's reload signal across neighbor processors!
+ * Generates Mindustry Schematics for Static Images with exact Mindustry Center-Tile Offset alignment!
  */
 class StaticSchematicGenerator(
     val config: StaticImageConfig,
@@ -32,6 +19,15 @@ class StaticSchematicGenerator(
 ) {
 
     private fun cmd(vararg parts: Any): String = parts.joinToString(" ")
+
+    /**
+     * Converts a bottom-left tile coordinate into Mindustry's center tile coordinate for a block of [blockSize].
+     * - size 1 -> +0
+     * - size 2 -> +0
+     * - size 3 -> +1 (Fixes 3x3 display overlapping left/bottom processors!)
+     * - size 6 -> +2 (Fixes 6x6 display overlapping left/bottom processors by 2 tiles!)
+     */
+    private fun centerTile(bottomLeft: Int, blockSize: Int): Int = bottomLeft + (blockSize - 1) / 2
 
     private fun generatePerimeterSlots(dispW: Int, dispH: Int, step: Int, countNeeded: Int): List<Point2> {
         val slots = ArrayList<Point2>()
@@ -97,7 +93,7 @@ class StaticSchematicGenerator(
         val dispTotalW = config.totalTilesX
         val dispTotalH = config.totalTilesY
 
-        val auxiliarySlots = if (procSpan == 1) 2 else 1 // Switch + Message
+        val auxiliarySlots = if (procSpan == 1) 2 else 1
         val totalSlotsNeeded = auxiliarySlots + totalWorkers
         val perimeter = generatePerimeterSlots(dispTotalW, dispTotalH, procSpan, totalSlotsNeeded)
 
@@ -116,9 +112,11 @@ class StaticSchematicGenerator(
 
         for (gx in 0 until gridX) {
             for (gy in 0 until gridY) {
-                val dx = dispBaseX + gx * dispSpan
-                val dy = dispBaseY + gy * dispSpan
-                tiles.add(Schematic.Stile(displayBlock, dx, dy, null, 0.toByte()))
+                val blX = dispBaseX + gx * dispSpan
+                val blY = dispBaseY + gy * dispSpan
+                val cx = centerTile(blX, dispSpan)
+                val cy = centerTile(blY, dispSpan)
+                tiles.add(Schematic.Stile(displayBlock, cx, cy, null, 0.toByte()))
             }
         }
 
@@ -140,21 +138,22 @@ class StaticSchematicGenerator(
         val workerPositions = ArrayList<Point2>(totalWorkers)
         for (i in 0 until totalWorkers) {
             val pt = perimeter[i + auxiliarySlots]
-            workerPositions.add(Point2(pt.x + offsetX, pt.y + offsetY))
+            val cx = centerTile(pt.x + offsetX, procSpan)
+            val cy = centerTile(pt.y + offsetY, procSpan)
+            workerPositions.add(Point2(cx, cy))
         }
 
-        // Link each perimeter processor to the nearest 1x1 display tile (always 1..2 tiles away, well within 10-tile range!).
-        // In Mindustry's TiledLogicDisplay, all merged tiles share the SAME global canvas origin (0,0 at bottom-left)!
-        fun findClosestTile(procX: Int, procY: Int): Point2 {
+        fun findClosestTileCenter(procX: Int, procY: Int): Point2 {
             val bestGx = ((procX - dispBaseX) / dispSpan).coerceIn(0, gridX - 1)
             val bestGy = ((procY - dispBaseY) / dispSpan).coerceIn(0, gridY - 1)
-            return Point2(dispBaseX + bestGx * dispSpan, dispBaseY + bestGy * dispSpan)
+            val blX = dispBaseX + bestGx * dispSpan
+            val blY = dispBaseY + bestGy * dispSpan
+            return Point2(centerTile(blX, dispSpan), centerTile(blY, dispSpan))
         }
 
-        // Build Worker 0 (Master Controller + Slice 0)
         val w0Pos = workerPositions[0]
         val w0Slice = slices.firstOrNull() ?: StaticWorkerSlice(0, 0, 0, emptyList(), emptyMap())
-        val w0Disp = findClosestTile(w0Pos.x, w0Pos.y)
+        val w0Disp = findClosestTileCenter(w0Pos.x, w0Pos.y)
         val w0Code = buildTiledControllerCode(w0Slice, totalWorkers)
         val w0Links = Seq<LogicLink>()
         w0Links.add(LogicLink(switchX - w0Pos.x, switchY - w0Pos.y, "switch1", true))
@@ -166,13 +165,11 @@ class StaticSchematicGenerator(
         }
         tiles.add(Schematic.Stile(procBlock, w0Pos.x, w0Pos.y, LogicBlock.compress(w0Code, w0Links), 0.toByte()))
 
-        // Build Chained Workers 1 .. N-1
-        // Each Worker i links to its nearest display tile AND links to Worker i+1 ("processor1") in a daisy-chain!
         for (i in 1 until totalWorkers) {
             val wPos = workerPositions[i]
             val slice = slices[i]
             val hasNext = i < totalWorkers - 1
-            val disp = findClosestTile(wPos.x, wPos.y)
+            val disp = findClosestTileCenter(wPos.x, wPos.y)
 
             val wCode = buildTiledChainedWorkerCode(i, slice, hasNext)
             val wLinks = Seq<LogicLink>()
@@ -185,15 +182,12 @@ class StaticSchematicGenerator(
             tiles.add(Schematic.Stile(procBlock, wPos.x, wPos.y, LogicBlock.compress(wCode, wLinks), 0.toByte()))
         }
 
-        return finalizeSchematic(name, tiles, dispBaseX + dispTotalW, dispBaseY + dispTotalH, totalWorkers)
+        return finalizeSchematic(name, tiles, dispBaseX + dispTotalW + offsetX, dispBaseY + dispTotalH + offsetY, totalWorkers)
     }
 
     /**
      * ARCHITECTURE B: 3x3 (max 5x5) and 6x6 (max 4x4) Multi-Screen Chunk Mode.
-     * - Forced 2x2 Logic Processors.
-     * - Each screen (gx, gy) is an independent chunk.
-     * - Processors are placed right next to their assigned screen (gx, gy) so distance is always <= 10 tiles!
-     * - Workers do NOT depend on a distant `cell1` (so 100% of screens render immediately even on a huge 24x24 6x6 grid!).
+     * Uses `centerTile(bl, dispSpan)` so 3x3 (+1) and 6x6 (+2) displays sit in the exact center of the processor ring!
      */
     private fun buildMultiScreenChunkedSchematic(name: String): Schematic {
         val slices = encoded.workerSlices
@@ -209,14 +203,12 @@ class StaticSchematicGenerator(
         val dispTotalH = config.totalTilesY
 
         val totalSlotsNeeded = 2 + totalWorkers
-        // Generate ample perimeter slots so every screen chunk can pick the closest slots to itself
         val candidateSlots = generatePerimeterSlots(dispTotalW, dispTotalH, procSpan, totalSlotsNeeded + 32)
         val allCandidates = candidateSlots.toMutableList()
 
         val auxSlot = allCandidates.removeAt(0)
         val ctrlSlot = allCandidates.removeAt(0)
 
-        // Assign each worker slice to the candidate slot closest to its target screen (screenX, screenY)
         val assignedWorkerSlots = ArrayList<Point2>(totalWorkers)
         for (slice in slices) {
             val targetScreenCenterX = slice.screenX * dispSpan + dispSpan / 2.0
@@ -228,7 +220,6 @@ class StaticSchematicGenerator(
                 val pt = allCandidates[idx]
                 val px = pt.x + procSpan / 2.0
                 val py = pt.y + procSpan / 2.0
-                // Pure distance to its assigned screen so it NEVER exceeds the 14-tile link range!
                 val dScreen = hypot(px - targetScreenCenterX, py - targetScreenCenterY)
                 if (dScreen < bestDist) {
                     bestDist = dScreen
@@ -255,12 +246,14 @@ class StaticSchematicGenerator(
         val dispBaseX = offsetX
         val dispBaseY = offsetY
 
-        // 1. Place Display Grid
+        // 1. Place Display Grid using exact Mindustry Center-Tile coordinates!
         for (gx in 0 until gridX) {
             for (gy in 0 until gridY) {
-                val dx = dispBaseX + gx * dispSpan
-                val dy = dispBaseY + gy * dispSpan
-                tiles.add(Schematic.Stile(displayBlock, dx, dy, null, 0.toByte()))
+                val blX = dispBaseX + gx * dispSpan
+                val blY = dispBaseY + gy * dispSpan
+                val cx = centerTile(blX, dispSpan)
+                val cy = centerTile(blY, dispSpan)
+                tiles.add(Schematic.Stile(displayBlock, cx, cy, null, 0.toByte()))
             }
         }
 
@@ -277,8 +270,8 @@ class StaticSchematicGenerator(
         tiles.add(Schematic.Stile(Blocks.message, msgX, msgY, "PicToLogic Chunked Static: Ready", 0.toByte()))
 
         // 3. Place Master Controller (2x2 Logic Processor)
-        val ctrlX = ctrlSlot.x + offsetX
-        val ctrlY = ctrlSlot.y + offsetY
+        val ctrlX = centerTile(ctrlSlot.x + offsetX, procSpan)
+        val ctrlY = centerTile(ctrlSlot.y + offsetY, procSpan)
         val ctrlCode = buildChunkedMasterControllerCode(totalWorkers, gridX * gridY)
         val ctrlLinks = Seq<LogicLink>()
         ctrlLinks.add(LogicLink(switchX - ctrlX, switchY - ctrlY, "switch1", true))
@@ -286,17 +279,18 @@ class StaticSchematicGenerator(
         ctrlLinks.add(LogicLink(msgX - ctrlX, msgY - ctrlY, "message1", true))
         tiles.add(Schematic.Stile(procBlock, ctrlX, ctrlY, LogicBlock.compress(ctrlCode, ctrlLinks), 0.toByte()))
 
-        // 4. Place Chunk Workers (2x2 Logic Processors)
-        // Each worker links directly to its adjacent screen `display1` (and `cell1` if within 13.5 tiles).
+        // 4. Place Chunk Workers (2x2 Logic Processors) linked to the exact center tile of their target screen!
         val screenWorkerOrder = HashMap<Pair<Int, Int>, Int>()
         for (i in slices.indices) {
             val slice = slices[i]
             val pt = assignedWorkerSlots[i]
-            val wx = pt.x + offsetX
-            val wy = pt.y + offsetY
+            val wx = centerTile(pt.x + offsetX, procSpan)
+            val wy = centerTile(pt.y + offsetY, procSpan)
 
-            val targetDispX = dispBaseX + slice.screenX * dispSpan
-            val targetDispY = dispBaseY + slice.screenY * dispSpan
+            val targetBlX = dispBaseX + slice.screenX * dispSpan
+            val targetBlY = dispBaseY + slice.screenY * dispSpan
+            val targetDispCenterX = centerTile(targetBlX, dispSpan)
+            val targetDispCenterY = centerTile(targetBlY, dispSpan)
 
             val screenKey = slice.screenX to slice.screenY
             val orderInScreen = screenWorkerOrder[screenKey] ?: 0
@@ -307,7 +301,7 @@ class StaticSchematicGenerator(
 
             val wCode = buildChunkWorkerCode(i, slice, orderInScreen, canLinkCell)
             val wLinks = Seq<LogicLink>()
-            wLinks.add(LogicLink(targetDispX - wx, targetDispY - wy, "display1", true))
+            wLinks.add(LogicLink(targetDispCenterX - wx, targetDispCenterY - wy, "display1", true))
             if (canLinkCell) {
                 wLinks.add(LogicLink(cellX - wx, cellY - wy, "cell1", true))
             }
@@ -315,7 +309,7 @@ class StaticSchematicGenerator(
             tiles.add(Schematic.Stile(procBlock, wx, wy, LogicBlock.compress(wCode, wLinks), 0.toByte()))
         }
 
-        return finalizeSchematic(name, tiles, dispBaseX + dispTotalW, dispBaseY + dispTotalH, totalWorkers)
+        return finalizeSchematic(name, tiles, dispBaseX + dispTotalW + offsetX, dispBaseY + dispTotalH + offsetY, totalWorkers)
     }
 
     private fun finalizeSchematic(
@@ -328,9 +322,11 @@ class StaticSchematicGenerator(
         var maxXBound = initMaxX
         var maxYBound = initMaxY
         for (t in tiles) {
-            val bSpan = t.block.size
-            if (t.x + bSpan > maxXBound) maxXBound = t.x.toInt() + bSpan
-            if (t.y + bSpan > maxYBound) maxYBound = t.y.toInt() + bSpan
+            val bSize = t.block.size
+            val topRightX = t.x.toInt() - (bSize - 1) / 2 + bSize
+            val topRightY = t.y.toInt() - (bSize - 1) / 2 + bSize
+            if (topRightX > maxXBound) maxXBound = topRightX
+            if (topRightY > maxYBound) maxYBound = topRightY
         }
 
         val tags = StringMap()
@@ -342,11 +338,6 @@ class StaticSchematicGenerator(
         return Schematic(tiles, tags, maxXBound, maxYBound)
     }
 
-    /**
-     * Controller for Mode A (1x1 Tiled Daisy-Chain):
-     * - Draws Slice 0 using global coordinates (+6px bezel offset).
-     * - Triggers downstream chain via temporary pulse on `processor1` when Switch is clicked.
-     */
     private fun buildTiledControllerCode(
         slice0: StaticWorkerSlice,
         totalWorkers: Int
@@ -376,7 +367,6 @@ class StaticSchematicGenerator(
         sb.appendLine("print \"Est. Time: ~${secStr}s\"")
         sb.appendLine(cmd("printflush", "msg"))
 
-        // Draw Slice 0
         sb.appendLine(cmd("draw", "reset", 0, 0, 0, 0, 0, 0))
         for ((_, runs) in slice0.groupedByColor) {
             if (runs.isEmpty()) continue
@@ -387,7 +377,6 @@ class StaticSchematicGenerator(
         }
         sb.appendLine(cmd("drawflush", "disp"))
 
-        // Pulse processor1 (briefly disable for 1 tick then re-enable) to propagate reload signal down the chain!
         if (totalWorkers > 1) {
             sb.appendLine(cmd("control", "enabled", "processor1", 0, 0, 0, 0))
             sb.appendLine(cmd("wait", 0.03f))
@@ -413,13 +402,6 @@ class StaticSchematicGenerator(
         return sb.toString()
     }
 
-    /**
-     * Daisy-Chained Worker Code for Mode A (1x1 Tiled Display):
-     * - Uses global coordinates (+6px bezel offset) so all 16x16 tiles render seamlessly!
-     * - Staggers initial draw by `workerIdx * 0.04s` so the 256-cmd display buffer never overflows!
-     * - Relays reload pulses along `processor1` and periodically refreshes every few seconds so
-     *   the static image stays permanently rendered even if displays are rebuilt!
-     */
     private fun buildTiledChainedWorkerCode(
         workerIdx: Int,
         slice: StaticWorkerSlice,
@@ -451,8 +433,6 @@ class StaticSchematicGenerator(
             sb.appendLine(cmd("control", "enabled", "processor1", 1, 0, 0, 0))
         }
 
-        // Wait loop: re-draws immediately on World Reload (@tick < last_tick)
-        // or every ~4 seconds (staggered) to keep the static canvas 100% persistent!
         sb.appendLine(cmd("set", "w_cnt", 0))
         sb.appendLine("wait_loop:")
         sb.appendLine(cmd("jump", "do_draw", "lessThan", "@tick", "last_tick"))
@@ -465,9 +445,6 @@ class StaticSchematicGenerator(
         return sb.toString()
     }
 
-    /**
-     * Master Controller for Mode B (3x3 and 6x6 Multi-Screen Chunked Mode).
-     */
     private fun buildChunkedMasterControllerCode(totalWorkers: Int, totalScreens: Int): String {
         val sb = StringBuilder()
         val nl = "\\" + "n"
@@ -506,12 +483,6 @@ class StaticSchematicGenerator(
         return sb.toString()
     }
 
-    /**
-     * Chunk Worker Code for Mode B (3x3 and 6x6 Displays):
-     * - NEVER blocks waiting for `cell1` if `cell1` is out of range (>14 tiles away on 6x6 grids)!
-     * - Immediately renders its assigned screen chunk `(screenX, screenY)` on placement and World Reload,
-     *   and listens to `cell1[0]` if within range (or refreshes periodically if out of cell range).
-     */
     private fun buildChunkWorkerCode(
         workerId: Int,
         slice: StaticWorkerSlice,

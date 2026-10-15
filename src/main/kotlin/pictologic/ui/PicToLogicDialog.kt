@@ -165,7 +165,7 @@ class PicToLogicDialog : BaseDialog("PicToLogic 2") {
         val leftScroll = Table()
         leftScroll.pane(leftPane).grow().scrollX(false)
 
-        root.add(leftScroll).growY().width(450f).pad(8f)
+        root.add(leftScroll).growY().width(560f).pad(8f)
         root.image().color(Color.darkGray).width(4f).growY()
         root.add(rightPane).grow().pad(8f)
 

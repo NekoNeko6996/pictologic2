@@ -1,5 +1,5 @@
-displayName: "GifToLogic"
-name: "giftologic"
+displayName: "pictologic2"
+name: "pictologic2"
 author: "Nguyen Hoang Nam"
 main: "pictologic.PicToLogicMod"
 description: "High-performance GIF and image sequence to Mindustry Logic schematic converter using RLE Scanline + Palette encoding."

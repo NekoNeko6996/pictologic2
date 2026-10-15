@@ -1,0 +1,9 @@
+displayName: "GifToLogic"
+name: "giftologic"
+author: "Nguyen Hoang Nam"
+main: "pictologic.PicToLogicMod"
+description: "High-performance GIF and image sequence to Mindustry Logic schematic converter using RLE Scanline + Palette encoding."
+version: 1.0
+minGameVersion: 154
+java: true
+hidden: true

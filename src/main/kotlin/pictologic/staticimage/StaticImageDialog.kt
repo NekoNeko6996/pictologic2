@@ -17,6 +17,7 @@ import arc.scene.ui.TextField
 import arc.scene.ui.Tooltip
 import arc.scene.ui.layout.Table
 import arc.util.Log
+import arc.util.Scaling
 import mindustry.Vars
 import mindustry.gen.Icon
 import mindustry.gen.Tex
@@ -30,13 +31,18 @@ import pictologic.layout.DisplayType
 import pictologic.layout.ProcessorChoice
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
 
     private var selectedFile: Fi? = null
+    private var cachedSourcePixmap: Pixmap? = null
     private var encodedImage: EncodedStaticImage? = null
     private var activePalette: Palette? = null
+    // True when quantized preview is active; false when user tweaks grid sliders for instant live preview
+    private var isQuantizedPreviewValid = false
 
     private var displayType = DisplayType.TILED_LOGIC_DISPLAY
     private var gridScreensX = 10
@@ -45,9 +51,11 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private var aspectMode = AspectMode.FIT
     private var paletteColors = 16
     private var watermarkText = ""
-    private var watermarkColorRgba = -0x1 // White (0xFFFFFFFF)
+    private var watermarkColorRgba = -0x1
     private val isEncoding = AtomicBoolean(false)
 
+    // Fixed high-res square viewport for distortion-free rectangular grid preview
+    private val viewportSize = 480
     private var previewPixmap: Pixmap? = null
     private var previewTexture: Texture? = null
     private var previewImage: Image? = null
@@ -56,6 +64,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private val fileDetailsLabel = Label("")
     private val statsLabel = Label("Select a static image to start")
     private val modeInfoLabel = Label("")
+    private val coverageInfoLabel = Label("")
     private val paletteTable = Table(Tex.pane)
 
     private val displayButtons = ArrayList<Pair<DisplayType, TextButton>>()
@@ -70,7 +79,6 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private lateinit var sliderGridY: Slider
 
     companion object {
-        // Preset RGBA8888 colors for watermark selection
         private val WATERMARK_COLORS = listOf(
             "White" to (0xFFFFFFFF.toInt()),
             "Gold" to (0xFFD700FF.toInt()),
@@ -130,15 +138,27 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
 
         if (displayType != DisplayType.TILED_LOGIC_DISPLAY) {
             processorChoice = ProcessorChoice.LOGIC_PROCESSOR
-            modeInfoLabel.setText("[accent]Chế độ Chunk (3x3 / 6x6):[] Mỗi màn hình là 1 chunk riêng, bắt buộc dùng [gold]Logic Processor (2x2)[] đồng bộ qua Controller chính.")
-        } else {
-            modeInfoLabel.setText("[sky]Chế độ Nối Chuỗi (1x1 Tiled, tối đa 16x16):[] Các vi xử lý liên kết theo chuỗi (Daisy-Chain) đến Controller.")
+        }
+        
+		isQuantizedPreviewValid = false
+        updateResolutionAndLivePreview()
+        refreshButtonHighlights()
+    }
+
+    private fun updateResolutionAndLivePreview() {
+        val cfg = config()
+        val cw = cfg.effectiveDisplayWidth
+        val ch = cfg.effectiveDisplayHeight
+        resVal.setText("${cw}x${ch} px")
+
+        val src = cachedSourcePixmap
+        if (src != null) {
+            val (dw, dh) = StaticImageEncoder.calculateDrawnDimensions(src.width, src.height, cw, ch, aspectMode)
+            val pctW = (dw * 100f / cw).roundToInt()
+            val pctH = (dh * 100f / ch).roundToInt()
         }
 
-        val cfg = config()
-        resVal.setText("${cfg.effectiveDisplayWidth}x${cfg.effectiveDisplayHeight} px")
-        refreshButtonHighlights()
-        updatePreviewOverlay()
+        renderDistortionFreePreview()
     }
 
     private fun refreshButtonHighlights() {
@@ -171,8 +191,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         val leftScroll = Table()
         leftScroll.pane(leftPane).grow().scrollX(false)
 
-        // Expanded left settings panel width to 560f so all buttons and text fit comfortably!
-        root.add(leftScroll).growY().width(560f).pad(8f)
+        root.add(leftScroll).growY().width(750f).pad(8f)
         root.image().color(Color.darkGray).width(4f).growY()
         root.add(rightPane).grow().pad(8f)
 
@@ -214,21 +233,21 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         val dispTypeTable = Table()
         displayButtons.clear()
 
-        val bTiled = dispTypeTable.button("Tiled 1x1 (Max 16x16)", Styles.togglet) {
+        val bTiled = dispTypeTable.button("Tiled 1x1", Styles.togglet) {
             displayType = DisplayType.TILED_LOGIC_DISPLAY
             applyDisplayTypeConstraints()
         }.height(36f).padRight(4f).growX().get()
         bTiled.addTip("Màn hình 1x1 ghép tối đa 16x16. Kết nối theo chuỗi (Daisy-Chain).")
         displayButtons.add(DisplayType.TILED_LOGIC_DISPLAY to bTiled)
 
-        val bLogic = dispTypeTable.button("Logic 3x3 (Max 5x5)", Styles.togglet) {
+        val bLogic = dispTypeTable.button("Logic 3x3", Styles.togglet) {
             displayType = DisplayType.LOGIC_DISPLAY
             applyDisplayTypeConstraints()
         }.height(36f).padRight(4f).growX().get()
         bLogic.addTip("Màn hình 3x3 (80x80px) ghép tối đa 5x5. Mỗi màn hình là 1 chunk riêng biệt.")
         displayButtons.add(DisplayType.LOGIC_DISPLAY to bLogic)
 
-        val bLarge = dispTypeTable.button("Large 6x6 (Max 4x4)", Styles.togglet) {
+        val bLarge = dispTypeTable.button("Large 6x6", Styles.togglet) {
             displayType = DisplayType.LARGE_LOGIC_DISPLAY
             applyDisplayTypeConstraints()
         }.height(36f).growX().get()
@@ -238,7 +257,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         step2.add(dispTypeTable).growX().padBottom(6f).row()
 
         val gridTable = Table()
-        gridTable.add(Label("Screen Grid: ")).left()
+        gridTable.add(Label("Screen Grid (W x H): ")).left()
         gridValX.setColor(Pal.accent)
         gridTable.add(gridValX).width(22f)
         gridTable.add(Label("x")).padRight(4f)
@@ -248,31 +267,39 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         sliderGridX = Slider(1f, 16f, 1f, false)
         sliderGridX.value = gridScreensX.toFloat()
         sliderGridX.moved { v ->
-            gridScreensX = v.toInt()
-            gridValX.setText("$gridScreensX")
-            val cfg = config()
-            resVal.setText("${cfg.effectiveDisplayWidth}x${cfg.effectiveDisplayHeight} px")
-            updatePreviewOverlay()
+            val newX = v.toInt()
+            if (newX != gridScreensX) {
+                gridScreensX = newX
+                gridValX.setText("$gridScreensX")
+                isQuantizedPreviewValid = false
+                updateResolutionAndLivePreview()
+            }
         }
         gridTable.add(sliderGridX).growX().padRight(4f)
 
         sliderGridY = Slider(1f, 16f, 1f, false)
         sliderGridY.value = gridScreensY.toFloat()
         sliderGridY.moved { v ->
-            gridScreensY = v.toInt()
-            gridValY.setText("$gridScreensY")
-            val cfg = config()
-            resVal.setText("${cfg.effectiveDisplayWidth}x${cfg.effectiveDisplayHeight} px")
-            updatePreviewOverlay()
+            val newY = v.toInt()
+            if (newY != gridScreensY) {
+                gridScreensY = newY
+                gridValY.setText("$gridScreensY")
+                isQuantizedPreviewValid = false
+                updateResolutionAndLivePreview()
+            }
         }
         gridTable.add(sliderGridY).growX()
         step2.add(gridTable).growX().padBottom(6f).row()
 
         val resTable = Table()
-        resTable.add(Label("Total Canvas Resolution: ")).left()
+        resTable.add(Label("Grid Canvas: ")).left()
         resVal.setColor(Pal.accent)
-        resTable.add(resVal).left()
-        step2.add(resTable).growX().padBottom(6f).row()
+        resTable.add(resVal).left().padRight(12f)
+		
+        step2.add(resTable).growX().padBottom(4f).row()
+
+        coverageInfoLabel.setWrap(true)
+        step2.add(coverageInfoLabel).growX().padBottom(6f).row()
 
         val aspectTable = Table()
         aspectTable.add(Label("Aspect: ")).left().padRight(4f)
@@ -280,7 +307,9 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         for (mode in AspectMode.values()) {
             val bMode = aspectTable.button(mode.name.lowercase(), Styles.togglet) {
                 aspectMode = mode
+                isQuantizedPreviewValid = false
                 refreshButtonHighlights()
+                updateResolutionAndLivePreview()
             }.height(32f).padRight(4f).growX().get()
             aspectButtons.add(mode to bMode)
         }
@@ -354,12 +383,15 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
             val g = ((rgba ushr 16) and 0xFF) / 255f
             val b = ((rgba ushr 8) and 0xFF) / 255f
 
-            val bColor = wmColorTable.button("", Styles.togglet) {
+            // Clone style so we NEVER mutate Mindustry's global Styles.togglet!
+            val customStyle = TextButton.TextButtonStyle(Styles.togglet)
+            customStyle.up = Tex.whiteui
+
+            val bColor = wmColorTable.button("", customStyle) {
                 watermarkColorRgba = rgba
                 refreshButtonHighlights()
                 if (selectedFile != null) triggerEncoding()
             }.size(30f, 30f).padRight(4f).get()
-            bColor.style.up = Tex.whiteui
             bColor.color.set(r, g, b, 1f)
             bColor.addTip("Màu Watermark: $cName")
             wmColorButtons.add(rgba to bColor)
@@ -388,7 +420,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
 
     private fun buildPreviewPane(pane: Table) {
         pane.top()
-        val previewTitle = Label("Static Image Preview")
+        val previewTitle = Label("Live Grid & Alignment Preview")
         previewTitle.setFontScale(1.1f)
         previewTitle.setColor(Color.sky)
         pane.add(previewTitle).left().padBottom(8f).row()
@@ -396,14 +428,12 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         val canvasContainer = Table(Tex.pane)
         canvasContainer.margin(10f)
 
-        previewPixmap = Pixmap(160, 160)
-        previewPixmap!!.fill(0x000000FF)
-        drawDisplayGridOverlay(previewPixmap!!, gridScreensX, gridScreensY, displayType.isTileable)
-
+        previewPixmap = Pixmap(viewportSize, viewportSize)
         previewTexture = Texture(previewPixmap)
         previewImage = Image(TextureRegion(previewTexture))
+        previewImage!!.setScaling(Scaling.fit)
 
-        canvasContainer.add(previewImage).size(380f, 380f).center()
+        canvasContainer.add(previewImage).size(420f, 420f).center()
         pane.add(canvasContainer).grow().center().padBottom(8f).row()
 
         val swatchContainer = Table()
@@ -411,6 +441,31 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         paletteTable.margin(6f).left()
         swatchContainer.add(paletteTable).growX()
         pane.add(swatchContainer).growX().padBottom(4f).row()
+    }
+
+    /**
+     * Automatically sets gridScreensX and gridScreensY to best match the loaded image's aspect ratio
+     * within the current displayType's maxGridLimit.
+     */
+    private fun autoFitGridToImageAspect() {
+        val src = cachedSourcePixmap ?: return
+        val maxGrid = StaticImageConfig.maxGridForType(displayType)
+        val imgAspect = src.width.toFloat() / max(1, src.height)
+
+        if (imgAspect >= 1f) {
+            gridScreensX = maxGrid
+            gridScreensY = (maxGrid / imgAspect).roundToInt().coerceIn(1, maxGrid)
+        } else {
+            gridScreensY = maxGrid
+            gridScreensX = (maxGrid * imgAspect).roundToInt().coerceIn(1, maxGrid)
+        }
+
+        sliderGridX.value = gridScreensX.toFloat()
+        sliderGridY.value = gridScreensY.toFloat()
+        gridValX.setText("$gridScreensX")
+        gridValY.setText("$gridScreensY")
+        isQuantizedPreviewValid = false
+        updateResolutionAndLivePreview()
     }
 
     private fun config(): StaticImageConfig {
@@ -437,12 +492,15 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
     private fun onFileSelected(file: Fi) {
         statusLabel.setText("Selected: [gold]${file.name()}[]")
         try {
+            cachedSourcePixmap?.dispose()
             val pm = Pixmap(file)
+            cachedSourcePixmap = pm
             fileDetailsLabel.setText("Original Size: [accent]${pm.width}x${pm.height}[] px | ${file.length() / 1024} KB")
-            pm.dispose()
         } catch (_: Exception) {
             fileDetailsLabel.setText("Size: ${file.length() / 1024} KB")
         }
+        isQuantizedPreviewValid = false
+        updateResolutionAndLivePreview()
         triggerEncoding()
     }
 
@@ -466,20 +524,9 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
                     encodedImage?.quantizedPixmap?.dispose()
                     encodedImage = result
                     activePalette = result.palette
+                    isQuantizedPreviewValid = true
 
-                    val cw = result.canvasWidth
-                    val ch = result.canvasHeight
-                    if (previewPixmap == null || previewPixmap!!.width != cw || previewPixmap!!.height != ch) {
-                        previewPixmap?.dispose()
-                        previewTexture?.dispose()
-                        previewPixmap = Pixmap(cw, ch)
-                        previewTexture = Texture(previewPixmap)
-                        previewImage?.setDrawable(TextureRegionDrawable(TextureRegion(previewTexture)))
-                    }
-
-                    previewPixmap!!.draw(result.quantizedPixmap, 0, 0, cw, ch, 0, 0, cw, ch, false)
-                    drawDisplayGridOverlay(previewPixmap!!, cfg.clampedGridX, cfg.clampedGridY, displayType.isTileable)
-                    previewTexture?.load(previewTexture!!.textureData)
+                    updateResolutionAndLivePreview()
 
                     val archDesc = if (cfg.isMultiScreenChunked) {
                         "${cfg.clampedGridX * cfg.clampedGridY} Screen Chunks (2x2 Logic)"
@@ -489,7 +536,7 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
 
                     statsLabel.setText(
                         "[green]Success![] 2D RLE Runs: [accent]${result.totalRuns}[] | Draw Cmds: [accent]${result.totalDrawInstructions}[]\n" +
-                        "Architecture: [accent]$archDesc[] | Total Workers: [accent]${result.totalWorkers}[]"
+                        "Drawn Area: [accent]${result.drawnWidth}x${result.drawnHeight}px[] / ${result.canvasWidth}x${result.canvasHeight}px | Workers: [accent]${result.totalWorkers}[] ($archDesc)"
                     )
 
                     updatePaletteSwatches(result.palette)
@@ -519,64 +566,129 @@ class StaticImageDialog : BaseDialog("PicToLogic - Static Image") {
         }
     }
 
-    private fun updatePreviewOverlay() {
-        val enc = encodedImage
+    /**
+     * Renders the true rectangular screen grid (e.g. 16x10) inside the square [previewPixmap] viewport
+     * without ANY aspect ratio distortion, aligning the image to the bottom-left corner of the grid!
+     */
+    private fun renderDistortionFreePreview() {
+        val vp = previewPixmap ?: return
         val cfg = config()
-        if (enc != null && previewPixmap != null) {
-            previewPixmap!!.draw(
+        val gx = cfg.clampedGridX
+        val gy = cfg.clampedGridY
+
+        // 1. Fill outside viewport with dark UI backdrop
+        vp.fill(0x14141AFF)
+
+        // 2. Compute true rectangular screen grid box inside viewport so every screen cell is a PERFECT SQUARE!
+        val margin = 12
+        val avail = viewportSize - margin * 2
+        val maxScreensDim = max(gx, gy)
+        val cellPx = max(4, avail / maxScreensDim)
+        val gridBoxW = gx * cellPx
+        val gridBoxH = gy * cellPx
+
+        val gridOriginX = (viewportSize - gridBoxW) / 2
+        val gridOriginY = (viewportSize - gridBoxH) / 2
+
+        // 3. Fill the screen grid area with Mindustry's unpainted display canvas gray (0x565666FF)
+        val unpaintedDisplayColor = 0x565666FF
+        for (y in gridOriginY until (gridOriginY + gridBoxH)) {
+            for (x in gridOriginX until (gridOriginX + gridBoxW)) {
+                vp.set(x, y, unpaintedDisplayColor)
+            }
+        }
+
+        // 4. Draw the image (either encoded quantizedPixmap or instant live cachedSourcePixmap) aligned to BOTTOM-LEFT!
+        val enc = encodedImage
+        val src = cachedSourcePixmap
+        if (isQuantizedPreviewValid && enc != null &&
+            enc.canvasWidth == cfg.effectiveDisplayWidth &&
+            enc.canvasHeight == cfg.effectiveDisplayHeight
+        ) {
+            // quantizedPixmap already has the image aligned bottom-left and unpainted gray in empty areas
+            vp.draw(
                 enc.quantizedPixmap,
                 0, 0, enc.quantizedPixmap.width, enc.quantizedPixmap.height,
-                0, 0, previewPixmap!!.width, previewPixmap!!.height, false
+                gridOriginX, gridOriginY, gridBoxW, gridBoxH,
+                false
             )
-            drawDisplayGridOverlay(previewPixmap!!, cfg.clampedGridX, cfg.clampedGridY, displayType.isTileable)
-            previewTexture?.load(previewTexture!!.textureData)
-        } else if (previewPixmap != null) {
-            previewPixmap!!.fill(0x000000FF)
-            drawDisplayGridOverlay(previewPixmap!!, cfg.clampedGridX, cfg.clampedGridY, displayType.isTileable)
-            previewTexture?.load(previewTexture!!.textureData)
+        } else if (src != null) {
+            // Instant Live Preview: calculate bottom-left drawn region inside gridBoxW x gridBoxH
+            val (drawBoxW, drawBoxH) = StaticImageEncoder.calculateDrawnDimensions(
+                srcW = src.width,
+                srcH = src.height,
+                canvasW = gridBoxW,
+                canvasH = gridBoxH,
+                aspectMode = aspectMode
+            )
+            // In Pixmap top-left coordinates, bottom-left of the grid box is:
+            // X = gridOriginX, Y = gridOriginY + (gridBoxH - drawBoxH)
+            val dstX = gridOriginX
+            val dstY = gridOriginY + (gridBoxH - drawBoxH)
+            vp.draw(src, 0, 0, src.width, src.height, dstX, dstY, drawBoxW, drawBoxH, false)
         }
+
+        // 5. Draw square screen grid lines and outer bezel over the rectangular grid box
+        drawRectangularGridOverlay(vp, gridOriginX, gridOriginY, gridBoxW, gridBoxH, gx, gy, displayType.isTileable)
+
+        previewTexture?.load(previewTexture!!.textureData)
     }
 
-    private fun drawDisplayGridOverlay(pixmap: Pixmap, gridX: Int, gridY: Int, isTiled: Boolean) {
-        val w = pixmap.width
-        val h = pixmap.height
-        val borderColor = 0x2C2C36FF
-        val gridColor = if (isTiled) 0x3A3A46FF else 0x00E5FFFF
+    private fun drawRectangularGridOverlay(
+        pixmap: Pixmap,
+        startX: Int,
+        startY: Int,
+        boxW: Int,
+        boxH: Int,
+        gridX: Int,
+        gridY: Int,
+        isTiled: Boolean
+    ) {
+        val borderColor = 0x8E8EA0FF.toInt()
+        val gridColor = if (isTiled) 0x282834FF else 0x00E5FFFF
 
-        for (i in 0 until 2) {
-            for (x in 0 until w) {
-                pixmap.set(x, i, borderColor)
-                pixmap.set(x, h - 1 - i, borderColor)
+        // Outer metallic bezel around the active screen grid
+        for (t in 0 until 2) {
+            for (x in startX until (startX + boxW)) {
+                pixmap.set(x, startY + t, borderColor)
+                pixmap.set(x, startY + boxH - 1 - t, borderColor)
             }
-            for (y in 0 until h) {
-                pixmap.set(i, y, borderColor)
-                pixmap.set(w - 1 - i, y, borderColor)
+            for (y in startY until (startY + boxH)) {
+                pixmap.set(startX + t, y, borderColor)
+                pixmap.set(startX + boxW - 1 - t, y, borderColor)
             }
         }
 
+        // Perfectly square screen cell dividers
         if (gridX > 1) {
-            val stepX = w.toFloat() / gridX
+            val stepX = boxW.toFloat() / gridX
             for (gx in 1 until gridX) {
-                val lineX = (gx * stepX).toInt()
-                for (y in 0 until h) {
-                    pixmap.set(lineX, y, gridColor)
-                    if (!isTiled && lineX + 1 < w) pixmap.set(lineX + 1, y, gridColor)
+                val lx = startX + (gx * stepX).toInt()
+                for (y in startY until (startY + boxH)) {
+                    pixmap.set(lx, y, gridColor)
+                    if (!isTiled && lx + 1 < startX + boxW) pixmap.set(lx + 1, y, gridColor)
                 }
             }
         }
         if (gridY > 1) {
-            val stepY = h.toFloat() / gridY
+            val stepY = boxH.toFloat() / gridY
             for (gy in 1 until gridY) {
-                val lineY = (gy * stepY).toInt()
-                for (x in 0 until w) {
-                    pixmap.set(x, lineY, gridColor)
-                    if (!isTiled && lineY + 1 < h) pixmap.set(x, lineY + 1, gridColor)
+                val ly = startY + (gy * stepY).toInt()
+                for (x in startX until (startX + boxW)) {
+                    pixmap.set(x, ly, gridColor)
+                    if (!isTiled && ly + 1 < startY + boxH) pixmap.set(x, ly + 1, gridColor)
                 }
             }
         }
     }
 
     private fun exportSchematic() {
+        // If user adjusted grid sliders without clicking Convert & Encode yet, encode automatically or warn
+        if (!isQuantizedPreviewValid || encodedImage == null) {
+            Vars.ui.showInfo("Đang tự động mã hóa lại theo kích thước lưới màn hình mới...")
+            triggerEncoding()
+            return
+        }
         val enc = encodedImage ?: return
         try {
             val name = selectedFile?.nameWithoutExtension() ?: "Static Image"

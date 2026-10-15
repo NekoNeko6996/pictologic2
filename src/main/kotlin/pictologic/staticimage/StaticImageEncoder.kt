@@ -2,10 +2,12 @@ package pictologic.staticimage
 
 import arc.files.Fi
 import arc.graphics.Pixmap
-import pictologic.core.FrameSequence
+import pictologic.core.AspectMode
 import pictologic.core.Palette
 import pictologic.core.RleRun
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 data class StaticWorkerSlice(
     val workerIndex: Int,
@@ -22,6 +24,8 @@ data class EncodedStaticImage(
     val originalFile: Fi,
     val canvasWidth: Int,
     val canvasHeight: Int,
+    val drawnWidth: Int,
+    val drawnHeight: Int,
     val palette: Palette,
     val runs: List<RleRun>,
     val workerSlices: List<StaticWorkerSlice>,
@@ -42,21 +46,35 @@ class StaticImageEncoder(
         val canvasW = config.effectiveDisplayWidth
         val canvasH = config.effectiveDisplayHeight
 
-        // 1. Scale image to exact total display pixel dimensions
-        val scaledPixmap = FrameSequence.scalePixmap(
-            src = originalPixmap,
-            targetW = canvasW,
-            targetH = canvasH,
+        // 1. Calculate bottom-left aligned image dimensions preserving original aspect ratio
+        val (drawnW, drawnH) = calculateDrawnDimensions(
+            srcW = originalPixmap.width,
+            srcH = originalPixmap.height,
+            canvasW = canvasW,
+            canvasH = canvasH,
             aspectMode = config.aspectMode
         )
+
+        // Scale original image ONLY to (drawnW x drawnH)
+        val scaledImage = Pixmap(drawnW, drawnH)
+        if (config.aspectMode == AspectMode.CROP) {
+            val scale = max(canvasW.toFloat() / originalPixmap.width, canvasH.toFloat() / originalPixmap.height)
+            val cropW = min(originalPixmap.width, (canvasW / scale).roundToInt())
+            val cropH = min(originalPixmap.height, (canvasH / scale).roundToInt())
+            // Bottom-left crop in source image (in Pixmap top-left coords: x = 0, y = srcH - cropH)
+            val srcY = max(0, originalPixmap.height - cropH)
+            scaledImage.draw(originalPixmap, 0, srcY, cropW, cropH, 0, 0, drawnW, drawnH, false)
+        } else {
+            scaledImage.draw(originalPixmap, 0, 0, originalPixmap.width, originalPixmap.height, 0, 0, drawnW, drawnH, false)
+        }
         originalPixmap.dispose()
 
         val wmText = config.watermarkText.trim().take(15)
         val hasWatermark = wmText.isNotEmpty()
 
-        // 2. Generate optimal palette (reserve 1 slot for exact watermark color if watermark is active)
+        // 2. Build optimal palette from the actual drawn image pixels only (not empty canvas space!)
         val baseColorCount = if (hasWatermark) max(2, config.paletteSize - 1) else config.paletteSize
-        val basePalette = Palette.fromPixmaps(listOf(scaledPixmap), baseColorCount)
+        val basePalette = Palette.fromPixmaps(listOf(scaledImage), baseColorCount)
 
         val finalColors = if (hasWatermark && !basePalette.colors.contains(config.watermarkColorRgba)) {
             basePalette.colors + intArrayOf(config.watermarkColorRgba)
@@ -65,32 +83,46 @@ class StaticImageEncoder(
         }
         val palette = Palette(finalColors)
 
-        // 3. Draw watermark onto scaledPixmap (top-right corner) before quantization
+        // 3. Draw watermark at top-right of the drawn image area
         if (hasWatermark) {
-            drawWatermarkTopRight(scaledPixmap, wmText, config.watermarkColorRgba)
+            drawWatermarkTopRight(scaledImage, wmText, config.watermarkColorRgba)
         }
 
-        // 4. Quantize pixels (invert Y so 0 is bottom-left as in Mindustry displays)
-        val indices = IntArray(canvasW * canvasH)
+        // 4. Populate canvas indices (-1 = EMPTY/UNTOUCHED pixel that will NOT be drawn!)
+        // In Mindustry display coordinates: (0,0) is bottom-left!
+        // Since image is bottom-left aligned, it occupies x in [0 .. drawnW - 1] and y in [0 .. drawnH - 1].
+        val indices = IntArray(canvasW * canvasH) { -1 }
         val quantizedPixmap = Pixmap(canvasW, canvasH)
+        // Fill empty canvas background with Mindustry's native unpainted display gray (0x565666FF) for preview
+        quantizedPixmap.fill(0x565666FF)
 
-        for (y in 0 until canvasH) {
+        val pixmapTopOffset = canvasH - drawnH
+        for (y in 0 until drawnH) {
             val rowOffset = y * canvasW
-            val srcY = canvasH - 1 - y
-            for (x in 0 until canvasW) {
-                val rgba = scaledPixmap.get(x, srcY)
+            // y = 0 is bottom of drawn image -> in scaledImage (top-left origin), that is row (drawnH - 1 - y)
+            val srcY = drawnH - 1 - y
+            val dstPreviewY = pixmapTopOffset + srcY
+
+            for (x in 0 until drawnW) {
+                val rgba = scaledImage.get(x, srcY)
+                val alpha = rgba and 0xFF
+                if (alpha < 64) {
+                    // Transparent pixel in PNG -> leave as -1 (do not draw!)
+                    continue
+                }
                 val colorIdx = palette.findNearestIndex(rgba)
                 indices[rowOffset + x] = colorIdx
-                quantizedPixmap.set(x, srcY, palette.getColor(colorIdx))
+                quantizedPixmap.set(x, dstPreviewY, palette.getColor(colorIdx))
             }
         }
-        scaledPixmap.dispose()
+        scaledImage.dispose()
 
         val allMergedRuns = ArrayList<RleRun>()
         val workerSlices = ArrayList<StaticWorkerSlice>()
         var workerCounter = 0
 
         if (config.isMultiScreenChunked) {
+            // MODE B: 3x3 (80x80) or 6x6 (176x176) Displays
             val screenPx = config.displayType.nativeSize
             val stepPx = screenPx + config.screenBezelGapPx
 
@@ -99,20 +131,33 @@ class StaticImageEncoder(
                     val startX = sx * stepPx
                     val startY = sy * stepPx
 
+                    // If this entire screen chunk lies outside the drawn image area, skip it completely!
+                    if (startX >= drawnW || startY >= drawnH) continue
+
                     val rawChunkRuns = ArrayList<RleRun>()
                     for (localY in 0 until screenPx) {
                         val globalY = startY + localY
-                        if (globalY >= canvasH) break
+                        if (globalY >= drawnH) break
                         val rowOffset = globalY * canvasW
 
                         var localX = 0
                         while (localX < screenPx) {
                             val globalX = startX + localX
-                            if (globalX >= canvasW) break
+                            if (globalX >= drawnW) break
 
                             val colorIdx = indices[rowOffset + globalX]
+                            // Skip empty / transparent pixels (-1)
+                            if (colorIdx < 0) {
+                                localX++
+                                continue
+                            }
+
                             var runEnd = localX + 1
-                            while (runEnd < screenPx && (startX + runEnd) < canvasW && indices[rowOffset + startX + runEnd] == colorIdx) {
+                            while (
+                                runEnd < screenPx &&
+                                (startX + runEnd) < drawnW &&
+                                indices[rowOffset + startX + runEnd] == colorIdx
+                            ) {
                                 runEnd++
                             }
                             val runWidth = runEnd - localX
@@ -136,14 +181,21 @@ class StaticImageEncoder(
                 }
             }
         } else {
+            // MODE A: 1x1 Tiled Logic Display (up to 16x16)
+            // Only scan up to (drawnW x drawnH), skipping all empty (-1) pixels!
             val rawRuns = ArrayList<RleRun>()
-            for (y in 0 until canvasH) {
+            for (y in 0 until drawnH) {
                 val rowOffset = y * canvasW
                 var x = 0
-                while (x < canvasW) {
+                while (x < drawnW) {
                     val colorIdx = indices[rowOffset + x]
+                    if (colorIdx < 0) {
+                        x++
+                        continue
+                    }
+
                     var runEnd = x + 1
-                    while (runEnd < canvasW && indices[rowOffset + runEnd] == colorIdx) {
+                    while (runEnd < drawnW && indices[rowOffset + runEnd] == colorIdx) {
                         runEnd++
                     }
                     val runWidth = runEnd - x
@@ -169,6 +221,8 @@ class StaticImageEncoder(
             originalFile = imageFile,
             canvasWidth = canvasW,
             canvasHeight = canvasH,
+            drawnWidth = drawnW,
+            drawnHeight = drawnH,
             palette = palette,
             runs = allMergedRuns,
             workerSlices = workerSlices,
@@ -176,21 +230,16 @@ class StaticImageEncoder(
         )
     }
 
-    /**
-     * Renders a crisp 5x7 pixel-art watermark at the top-right corner of [pixmap].
-     * Automatically scales font size according to canvas resolution.
-     */
     private fun drawWatermarkTopRight(pixmap: Pixmap, text: String, colorRgba: Int) {
         val w = pixmap.width
         val h = pixmap.height
-        val scale = max(1, w / 180)
+        val scale = max(1, min(w, h) / 160)
         val charW = 5 * scale
-        val charH = 7 * scale
         val spacing = 1 * scale
-        val margin = max(3, 4 * scale)
+        val margin = max(2, 3 * scale)
 
         val totalTextW = text.length * charW + max(0, text.length - 1) * spacing
-        val startX = max(2, w - totalTextW - margin)
+        val startX = max(1, w - totalTextW - margin)
         val startY = margin
 
         for (i in text.indices) {
@@ -288,7 +337,32 @@ class StaticImageEncoder(
     }
 
     companion object {
-        // Compact 5x7 pixel font table (5 bits per row, 7 rows per character)
+        /**
+         * Computes the bottom-left aligned image dimensions (drawnW, drawnH) inside (canvasW, canvasH).
+         * - FIT: Preserves exact original aspect ratio so at least one axis touches the grid boundary,
+         *   leaving the extra space on the other axis untouched/empty!
+         * - STRETCH / CROP: Fills the entire (canvasW, canvasH).
+         */
+        fun calculateDrawnDimensions(
+            srcW: Int,
+            srcH: Int,
+            canvasW: Int,
+            canvasH: Int,
+            aspectMode: AspectMode
+        ): Pair<Int, Int> {
+            return when (aspectMode) {
+                AspectMode.FIT -> {
+                    val scale = min(canvasW.toFloat() / max(1, srcW), canvasH.toFloat() / max(1, srcH))
+                    val dw = (srcW * scale).roundToInt().coerceIn(1, canvasW)
+                    val dh = (srcH * scale).roundToInt().coerceIn(1, canvasH)
+                    dw to dh
+                }
+                AspectMode.STRETCH, AspectMode.CROP -> {
+                    canvasW to canvasH
+                }
+            }
+        }
+
         private val FONT_5X7: Map<Char, IntArray> = mapOf(
             ' ' to intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
             'A' to intArrayOf(0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),

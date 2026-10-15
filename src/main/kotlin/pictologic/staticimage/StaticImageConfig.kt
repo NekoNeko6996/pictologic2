@@ -46,18 +46,18 @@ data class StaticImageConfig(
         get() = if (isMultiScreenChunked) 16 else 0
 
     val tiledBezelOffsetPx: Int
-        get() = if (displayType == DisplayType.TILED_LOGIC_DISPLAY) 6 else 0
+        get() = 0
 
     val effectiveDisplayWidth: Int
         get() = when (displayType) {
-            DisplayType.TILED_LOGIC_DISPLAY -> max(1, clampedGridX * 32 - 12)
+            DisplayType.TILED_LOGIC_DISPLAY -> max(1, clampedGridX * 32)
             DisplayType.LOGIC_DISPLAY -> clampedGridX * 80 + (clampedGridX - 1) * screenBezelGapPx
             DisplayType.LARGE_LOGIC_DISPLAY -> clampedGridX * 176 + (clampedGridX - 1) * screenBezelGapPx
         }
 
     val effectiveDisplayHeight: Int
         get() = when (displayType) {
-            DisplayType.TILED_LOGIC_DISPLAY -> max(1, clampedGridY * 32 - 12)
+            DisplayType.TILED_LOGIC_DISPLAY -> max(1, clampedGridY * 32)
             DisplayType.LOGIC_DISPLAY -> clampedGridY * 80 + (clampedGridY - 1) * screenBezelGapPx
             DisplayType.LARGE_LOGIC_DISPLAY -> clampedGridY * 176 + (clampedGridY - 1) * screenBezelGapPx
         }

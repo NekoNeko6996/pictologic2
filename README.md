@@ -143,8 +143,8 @@ Requirements: JDK 17+ installed.
 
 ```bash
 # Clone the repository
-git clone https://github.com/NekoNeko6996/giftologic.git
-cd giftologic
+git clone https://github.com/NekoNeko6996/pictologic2.git
+cd pictologic2
 
 # Build shadow JAR
 ./gradlew shadowJar
